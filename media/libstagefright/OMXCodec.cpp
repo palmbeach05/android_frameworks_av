@@ -74,6 +74,11 @@
 #include <sec_format.h>
 #endif
 
+#ifdef USE_S3D_SUPPORT
+#include "Exynos_OMX_Def.h"
+#include "ExynosHWCService.h"
+#endif
+
 namespace android {
 
 #ifdef USE_SAMSUNG_COLORFORMAT
@@ -277,7 +282,7 @@ void OMXCodec::findMatchingCodecs(
     size_t index = 0;
 
 #ifdef ENABLE_AV_ENHANCEMENTS
-    //Check if application specially reuqested for  aac hardware encoder
+    //Check if application specially reuqested for aac hardware encoder/decoder
     //This is not a part of  mediacodec list
     if (matchComponentName &&
             !strncmp("OMX.qcom.audio.encoder.aac", matchComponentName, 26)) {
@@ -299,6 +304,17 @@ void OMXCodec::findMatchingCodecs(
             return;
     }
 #endif
+
+    if (matchComponentName &&
+            !strncmp("OMX.qcom.audio.decoder.multiaac", matchComponentName, 31)) {
+        matchingCodecs->add();
+
+        CodecNameAndQuirks *entry = &matchingCodecs->editItemAt(index);
+        entry->mName = String8("OMX.qcom.audio.decoder.multiaac");
+        entry->mQuirks |= kRequiresAllocateBufferOnInputPorts;
+        entry->mQuirks |= kRequiresAllocateBufferOnOutputPorts;
+        return;
+    }
 #endif
 
     for (;;) {
@@ -392,6 +408,17 @@ bool OMXCodec::findCodecQuirks(const char *componentName, uint32_t *quirks) {
         return false;
     }
 
+#ifdef ENABLE_AV_ENHANCEMENTS
+    //Check for aac hardware decoder
+    //This is not a part of  mediacodec list
+    if (componentName &&
+            !strncmp("OMX.qcom.audio.decoder.multiaac", componentName, 31)) {
+        *quirks |= kRequiresAllocateBufferOnInputPorts;
+        *quirks |= kRequiresAllocateBufferOnOutputPorts;
+        return true;
+    }
+#endif
+
     const sp<MediaCodecInfo> info = list->getCodecInfo(index);
     CHECK(info != NULL);
     *quirks = getComponentQuirks(info);
@@ -428,8 +455,14 @@ sp<MediaSource> OMXCodec::Create(
             "FLACDecoder", flags, &matchingCodecs);
     } else
 #endif
+    if (!strncmp(mime, MEDIA_MIMETYPE_AUDIO_AAC, 15) &&
+            ExtendedUtils::UseQCHWAACDecoder(mime)) {
+        findMatchingCodecs(mime, createEncoder,
+            "OMX.qcom.audio.decoder.multiaac", flags, &matchingCodecs);
+    } else {
         findMatchingCodecs(
             mime, createEncoder, matchComponentName, flags, &matchingCodecs);
+    }
 
     if (matchingCodecs.isEmpty()) {
         ALOGV("No matching codecs! (mime: %s, createEncoder: %s, "
@@ -2198,6 +2231,10 @@ status_t OMXCodec::allocateOutputBuffersFromNativeWindow() {
     }
     if (mFlags & kEnableGrallocUsageProtected) {
         usage |= GRALLOC_USAGE_PROTECTED;
+#ifdef GRALLOC_USAGE_PRIVATE_NONSECURE
+        if (!(mFlags & kUseSecureInputBuffers))
+            usage |= GRALLOC_USAGE_PRIVATE_NONSECURE;
+#endif
     }
 
     // Make sure to check whether either Stagefright or the video decoder
@@ -2976,7 +3013,40 @@ void OMXCodec::onEvent(OMX_EVENTTYPE event, OMX_U32 data1, OMX_U32 data2) {
             break;
         }
 #endif
+#ifdef USE_S3D_SUPPORT
+        case (OMX_EVENTTYPE)OMX_EventS3DInformation:
+        {
+            if (mFlags & kClientNeedsFramebuffer)
+                break;
 
+            sp<IServiceManager> sm = defaultServiceManager();
+            sp<android::IExynosHWCService> hwc = interface_cast<android::IExynosHWCService>(sm->getService(String16("Exynos.HWCService")));
+            if (hwc != NULL) {
+                if (data1 == OMX_TRUE) {
+                    int eS3DMode;
+                    switch (data2) {
+                    case OMX_SEC_FPARGMT_SIDE_BY_SIDE:
+                        eS3DMode = S3D_SBS;
+                        break;
+                    case OMX_SEC_FPARGMT_TOP_BOTTOM:
+                        eS3DMode = S3D_TB;
+                        break;
+                    case OMX_SEC_FPARGMT_CHECKERBRD_INTERL: // unsupport format at HDMI
+                    case OMX_SEC_FPARGMT_COLUMN_INTERL:
+                    case OMX_SEC_FPARGMT_ROW_INTERL:
+                    case OMX_SEC_FPARGMT_TEMPORAL_INTERL:
+                    default:
+                        eS3DMode = S3D_NONE;
+                    }
+
+                    hwc->setHdmiResolution(0, eS3DMode);
+                }
+            } else {
+                ALOGE("Exynos.HWCService is unavailable");
+            }
+            break;
+        }
+#endif
         default:
         {
             CODEC_LOGV("EVENT(%d, %u, %u)", event, data1, data2);
