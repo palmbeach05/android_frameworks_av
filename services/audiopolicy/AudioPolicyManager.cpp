@@ -330,7 +330,7 @@ status_t AudioPolicyManager::setDeviceConnectionState(audio_devices_t device,
             }
 
 #ifdef QCOM_DIRECTTRACK
-            if (audio_is_usb_device(device)) {
+            if (device & AUDIO_DEVICE_OUT_USB_ACCESSORY) {
                AudioParameter param;
                param.add(String8("usb_connected"), String8("true"));
                mpClientInterface->setParameters(0, param.toString());
@@ -410,7 +410,7 @@ status_t AudioPolicyManager::setDeviceConnectionState(audio_devices_t device,
             }
 
 #ifdef QCOM_DIRECTTRACK
-            if (audio_is_usb_device(device)) {
+            if (device & AUDIO_DEVICE_OUT_USB_ACCESSORY) {
                 // handle USB device disconnection
                 AudioParameter param;
                 param.add(String8("usb_connected"), String8("false"));
@@ -734,11 +734,8 @@ void AudioPolicyManager::setPhoneState(audio_mode_t state)
     // pertaining to sonification strategy see handleIncallSonification()
     if (isInCall()) {
         ALOGV("setPhoneState() in call state management: new state is %d", state);
-        for (size_t j = 0; j < mOutputs.size(); j++) {
-             audio_io_handle_t curOutput = mOutputs.keyAt(j);
-             for (int stream = 0; stream < AUDIO_STREAM_CNT; stream++) {
-                 handleIncallSonification((audio_stream_type_t)stream, false, true, curOutput);
-             }
+        for (int stream = 0; stream < AUDIO_STREAM_CNT; stream++) {
+            handleIncallSonification((audio_stream_type_t)stream, false, true);
         }
     }
 
@@ -1009,11 +1006,8 @@ void AudioPolicyManager::setPhoneState(audio_mode_t state)
     // pertaining to sonification strategy see handleIncallSonification()
     if (isStateInCall(state)) {
         ALOGV("setPhoneState() in call state management: new state is %d", state);
-        for (size_t j = 0; j < mOutputs.size(); j++) {
-             audio_io_handle_t curOutput = mOutputs.keyAt(j);
-             for (int stream = 0; stream < AUDIO_STREAM_CNT; stream++) {
-                 handleIncallSonification((audio_stream_type_t)stream, true, true, curOutput);
-             }
+        for (int stream = 0; stream < AUDIO_STREAM_CNT; stream++) {
+            handleIncallSonification((audio_stream_type_t)stream, true, true);
         }
     }
 
@@ -1631,8 +1625,8 @@ status_t AudioPolicyManager::startOutput(audio_io_handle_t output,
         uint32_t muteWaitMs = setOutputDevice(output, newDevice, force);
 
         // handle special case for sonification while in call
-        if (isInCall()) {
-            handleIncallSonification(stream, true, false, output);
+        if (isInCall() && (output == mPrimaryOutput)) {
+            handleIncallSonification(stream, true, false);
         }
 
         // apply volume rules for current stream and device if necessary
@@ -1666,12 +1660,8 @@ status_t AudioPolicyManager::stopOutput(audio_io_handle_t output,
     sp<AudioOutputDescriptor> outputDesc = mOutputs.valueAt(index);
 
     // handle special case for sonification while in call
-    if ((isInCall()) && (outputDesc->mRefCount[stream] == 1)) {
-        if (outputDesc->isDuplicated()) {
-            handleIncallSonification(stream, false, false, outputDesc->mOutput1->mIoHandle);
-            handleIncallSonification(stream, false, false, outputDesc->mOutput2->mIoHandle);
-        }
-        handleIncallSonification(stream, false, false, output);
+    if ((isInCall()) && (outputDesc->mRefCount[stream] == 1) && (output == mPrimaryOutput)) {
+        handleIncallSonification(stream, false, false);
     }
 
     if (outputDesc->mRefCount[stream] > 0) {
@@ -4526,7 +4516,7 @@ void AudioPolicyManager::checkA2dpSuspend()
     if (mA2dpSuspended) {
         if ((!isScoConnected ||
              ((mForceUse[AUDIO_POLICY_FORCE_FOR_COMMUNICATION] != AUDIO_POLICY_FORCE_BT_SCO) &&
-              (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] != AUDIO_POLICY_FORCE_BT_SCO))) &&
+              (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] != AUDIO_POLICY_FORCE_BT_SCO))) ||
              ((mPhoneState != AUDIO_MODE_IN_CALL) &&
               (mPhoneState != AUDIO_MODE_RINGTONE))) {
 
@@ -4538,7 +4528,7 @@ void AudioPolicyManager::checkA2dpSuspend()
     } else {
         if ((isScoConnected &&
              ((mForceUse[AUDIO_POLICY_FORCE_FOR_COMMUNICATION] == AUDIO_POLICY_FORCE_BT_SCO) ||
-              (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_BT_SCO))) ||
+              (mForceUse[AUDIO_POLICY_FORCE_FOR_RECORD] == AUDIO_POLICY_FORCE_BT_SCO))) &&
              ((mPhoneState == AUDIO_MODE_IN_CALL) ||
               (mPhoneState == AUDIO_MODE_RINGTONE))) {
 
@@ -5071,6 +5061,9 @@ uint32_t AudioPolicyManager::checkDeviceMuteStrategies(sp<AudioOutputDescriptor>
     uint32_t muteWaitMs = 0;
     audio_devices_t device = outputDesc->device();
     bool shouldMute = outputDesc->isActive() && (popcount(device) >= 2);
+    // temporary mute output if device selection changes to avoid volume bursts due to
+    // different per device volumes
+    bool tempMute = outputDesc->isActive() && (device != prevDevice);
 
     for (size_t i = 0; i < NUM_STRATEGIES; i++) {
         audio_devices_t curDevice = getDeviceForStrategy((routing_strategy)i, false /*fromCache*/);
@@ -5084,7 +5077,8 @@ uint32_t AudioPolicyManager::checkDeviceMuteStrategies(sp<AudioOutputDescriptor>
             doMute = true;
             outputDesc->mStrategyMutedByDevice[i] = false;
         }
-        if (doMute) {
+
+        if (doMute || tempMute) {
             for (size_t j = 0; j < mOutputs.size(); j++) {
                 sp<AudioOutputDescriptor> desc = mOutputs.valueAt(j);
                 // skip output if it does not share any device with current output
@@ -5097,43 +5091,47 @@ uint32_t AudioPolicyManager::checkDeviceMuteStrategies(sp<AudioOutputDescriptor>
                       mute ? "muting" : "unmuting", i, curDevice, curOutput);
                 setStrategyMute((routing_strategy)i, mute, curOutput, mute ? 0 : delayMs);
                 if (desc->isStrategyActive((routing_strategy)i)) {
-                    if (mute) {
-                        // FIXME: should not need to double latency if volume could be applied
-                        // immediately by the audioflinger mixer. We must account for the delay
-                        // between now and the next time the audioflinger thread for this output
-                        // will process a buffer (which corresponds to one buffer size,
-                        // usually 1/2 or 1/4 of the latency).
-                        if (muteWaitMs < desc->latency() * 2) {
-                            muteWaitMs = desc->latency() * 2;
+                    // do tempMute only for current output
+                    if (tempMute && !mute) {
+                        if ((desc != outputDesc) && (desc->device() == device)) {
+                            ALOGD("avoid tempmute on curOutput %d as device is same", curOutput);
+                        } else {
+                            setStrategyMute((routing_strategy)i, true, curOutput);
+
+#ifdef QCOM_DIRECTTRACK
+                            //Add IsFMEnabled to maitain FM status when FM device enabled
+                            AudioParameter param = AudioParameter(mpClientInterface->getParameters(0, String8("Fm-radio")));
+                            int IsFMEnabled;
+                            if (param.getInt(String8 ("isFMON"), IsFMEnabled) == NO_ERROR){
+                                ALOGD("getParameters(): Fm-radio with IsFMEnabled %d", IsFMEnabled);
+                            }
+                            //Change latency for tunnel/LPA player to make sure no noise on device switch
+                            //Routing to  BTA2DP,  USB device ,  Proxy(WFD) will take time, increasing latency time
+                            if((desc->mFlags & AUDIO_OUTPUT_FLAG_LPA) || (desc->mFlags & AUDIO_OUTPUT_FLAG_TUNNEL)
+                                || (device & AUDIO_DEVICE_OUT_USB_DEVICE) || (device & AUDIO_DEVICE_OUT_BLUETOOTH_A2DP)
+                                || (device & AUDIO_DEVICE_OUT_PROXY) || IsFMEnabled)
+                            {
+                               setStrategyMute((routing_strategy)i, false, curOutput,desc->latency()*4 ,device);
+                            }
+                            else
+#endif
+                               setStrategyMute((routing_strategy)i, false, curOutput,desc->latency()*2 ,device);
+                        }
+                    }
+                    if ((tempMute && (desc == outputDesc)) || mute) {
+                        if (muteWaitMs < desc->latency()) {
+                            muteWaitMs = desc->latency();
                         }
                     }
                 }
             }
         }
     }
-
-    // temporary mute output if device selection changes to avoid volume bursts due to
-    // different per device volumes
-    if (outputDesc->isActive() && (device != prevDevice)) {
-        if (muteWaitMs < outputDesc->latency() * 2) {
-            muteWaitMs = outputDesc->latency() * 2;
-        }
-        for (size_t i = 0; i < NUM_STRATEGIES; i++) {
-            if (outputDesc->isStrategyActive((routing_strategy)i)) {
-                setStrategyMute((routing_strategy)i, true, outputDesc->mIoHandle);
-                // do tempMute unmute after twice the mute wait time
-#ifdef QCOM_DIRECTTRACK
-                if((outputDesc->mFlags & AUDIO_OUTPUT_FLAG_LPA) || (outputDesc->mFlags & AUDIO_OUTPUT_FLAG_TUNNEL))
-                    {
-                     setStrategyMute((routing_strategy)i, false, outputDesc->mIoHandle,muteWaitMs*4 ,device);
-                }
-                else
-#endif
-                setStrategyMute((routing_strategy)i, false, outputDesc->mIoHandle,
-                                muteWaitMs *2, device);
-            }
-        }
-    }
+    // FIXME: should not need to double latency if volume could be applied immediately by the
+    // audioflinger mixer. We must account for the delay between now and the next time
+    // the audioflinger thread for this output will process a buffer (which corresponds to
+    // one buffer size, usually 1/2 or 1/4 of the latency).
+    muteWaitMs *= 2;
 
     // wait for the PCM output buffers to empty before proceeding with the rest of the command
     if (muteWaitMs > delayMs) {
@@ -6083,8 +6081,7 @@ void AudioPolicyManager::setStreamMute(audio_stream_type_t stream,
 }
 
 void AudioPolicyManager::handleIncallSonification(audio_stream_type_t stream,
-                                                      bool starting, bool stateChange,
-                                                      audio_io_handle_t output)
+                                                      bool starting, bool stateChange)
 {
     // if the stream pertains to sonification strategy and we are in call we must
     // mute the stream if it is low visibility. If it is high visibility, we must play a tone
@@ -6095,7 +6092,7 @@ void AudioPolicyManager::handleIncallSonification(audio_stream_type_t stream,
     const routing_strategy stream_strategy = getStrategy(stream);
     if ((stream_strategy == STRATEGY_SONIFICATION) ||
             ((stream_strategy == STRATEGY_SONIFICATION_RESPECTFUL))) {
-        sp<AudioOutputDescriptor> outputDesc = mOutputs.valueFor(output);
+        sp<AudioOutputDescriptor> outputDesc = mOutputs.valueFor(mPrimaryOutput);
         ALOGV("handleIncallSonification() stream %d starting %d device %x stateChange %d",
                 stream, starting, outputDesc->mDevice, stateChange);
         if (outputDesc->mRefCount[stream]) {
@@ -6106,7 +6103,7 @@ void AudioPolicyManager::handleIncallSonification(audio_stream_type_t stream,
             if (audio_is_low_visibility(stream)) {
                 ALOGV("handleIncallSonification() low visibility, muteCount %d", muteCount);
                 for (int i = 0; i < muteCount; i++) {
-                    setStreamMute(stream, starting, output);
+                    setStreamMute(stream, starting, mPrimaryOutput);
                 }
             } else {
                 ALOGV("handleIncallSonification() high visibility");
@@ -6114,7 +6111,7 @@ void AudioPolicyManager::handleIncallSonification(audio_stream_type_t stream,
                         getDeviceForStrategy(STRATEGY_PHONE, true /*fromCache*/)) {
                     ALOGV("handleIncallSonification() high visibility muted, muteCount %d", muteCount);
                     for (int i = 0; i < muteCount; i++) {
-                        setStreamMute(stream, starting, output);
+                        setStreamMute(stream, starting, mPrimaryOutput);
                     }
                 }
                 if (starting) {
