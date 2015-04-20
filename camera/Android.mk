@@ -28,6 +28,12 @@ ifeq ($(BOARD_OVERLAY_BASED_CAMERA_HAL),true)
     LOCAL_SRC_FILES += Overlay.cpp
 endif
 
+ifeq ($(BOARD_HAS_MTK_HARDWARE),true)
+	LOCAL_SRC_FILES+= \
+		MtkCameraParameters.cpp
+
+endif
+
 LOCAL_SHARED_LIBRARIES := \
 	libcutils \
 	libutils \
