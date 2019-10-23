@@ -81,6 +81,10 @@
 #include "HDCP.h"
 #include "HTTPBase.h"
 #include "RemoteDisplay.h"
+
+static const int kDumpLockRetries = 50;
+static const int kDumpLockSleepUs = 20000;
+
 #ifdef QCOM_DIRECTTRACK
 #define DEFAULT_SAMPLE_RATE 44100
 #endif
@@ -372,12 +376,32 @@ status_t MediaPlayerService::Client::dump(int fd, const Vector<String16>& args) 
     snprintf(buffer, 255, "  pid(%d), connId(%d), status(%d), looping(%s)\n",
             mPid, mConnId, mStatus, mLoop?"true": "false");
     result.append(buffer);
-    write(fd, result.string(), result.size());
-    if (mPlayer != NULL) {
-        mPlayer->dump(fd, args);
+
+    sp<MediaPlayerBase> p;
+    sp<AudioOutput> audioOutput;
+    bool locked = false;
+    for (int i = 0; i < kDumpLockRetries; ++i) {
+        if (mLock.tryLock() == NO_ERROR) {
+            locked = true;
+            break;
+        }
+        usleep(kDumpLockSleepUs);
     }
-    if (mAudioOutput != 0) {
-        mAudioOutput->dump(fd, args);
+
+    if (locked) {
+        p = mPlayer;
+        audioOutput = mAudioOutput;
+        mLock.unlock();
+    } else {
+        result.append("  lock is taken, no dump from player and audio output\n");
+    }
+    write(fd, result.string(), result.size());
+
+    if (p != NULL) {
+        p->dump(fd, args);
+    }
+    if (audioOutput != 0) {
+        audioOutput->dump(fd, args);
     }
     write(fd, "\n", 1);
     return NO_ERROR;
@@ -503,6 +527,12 @@ void MediaPlayerService::removeClient(wp<Client> client)
     mClients.remove(client);
 }
 
+bool MediaPlayerService::hasClient(wp<Client> client)
+{
+    Mutex::Autolock lock(mLock);
+    return mClients.indexOf(client) != NAME_NOT_FOUND;
+}
+
 MediaPlayerService::Client::Client(
         const sp<MediaPlayerService>& service, pid_t pid,
         int32_t connId, const sp<IMediaPlayerClient>& client,
@@ -528,7 +558,10 @@ MediaPlayerService::Client::Client(
 MediaPlayerService::Client::~Client()
 {
     ALOGV("Client(%d) destructor pid = %d", mConnId, mPid);
-    mAudioOutput.clear();
+    {
+        Mutex::Autolock l(mLock);
+        mAudioOutput.clear();
+    }
     wp<Client> client(this);
     disconnect();
     mService->removeClient(client);
@@ -544,9 +577,8 @@ void MediaPlayerService::Client::disconnect()
         Mutex::Autolock l(mLock);
         p = mPlayer;
         mClient.clear();
+        mPlayer.clear();
     }
-
-    mPlayer.clear();
 
     // clear the notification to prevent callbacks to dead client
     // and reset the player. We assume the player will serialize
@@ -568,7 +600,7 @@ void MediaPlayerService::Client::disconnect()
 sp<MediaPlayerBase> MediaPlayerService::Client::createPlayer(player_type playerType)
 {
     // determine if we have the right player type
-    sp<MediaPlayerBase> p = mPlayer;
+    sp<MediaPlayerBase> p = getPlayer();
     if ((p != NULL) && (p->playerType() != playerType)) {
         ALOGV("delete player");
         p.clear();
@@ -623,6 +655,7 @@ void MediaPlayerService::Client::setDataSource_post(
     }
 
     if (mStatus == OK) {
+        Mutex::Autolock l(mLock);
         mPlayer = p;
     }
 }
@@ -932,6 +965,10 @@ status_t MediaPlayerService::Client::setNextPlayer(const sp<IMediaPlayer>& playe
     ALOGD("gapless:setNextPlayer");
     Mutex::Autolock l(mLock);
     sp<Client> c = static_cast<Client*>(player.get());
+    if (c != NULL && !mService->hasClient(c)) {
+      return BAD_VALUE;
+    }
+
     mNextClient = c;
 
     if (c != NULL) {
